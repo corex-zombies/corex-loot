@@ -3,6 +3,17 @@ Config.Debug = false
 
 Config.ItemsPerContainer = { min = 2, max = 5 }
 
+-- Locked containers (consumed by skill `k_lock` via the corex-skills lockpick
+-- minigame). Map of container id → true. Container ids follow the pattern
+-- `loc_<locationIndex>_c_<containerIndex>` (1-based). Locked containers
+-- prompt the lockpick minigame; the skill widens the success zone.
+--
+-- Example below locks the FIRST container at the FIRST configured location.
+-- Adjust to taste once you know which spots you want gated.
+Config.LockedContainers = {
+    -- ['loc_1_c_1'] = true,
+}
+
 Config.Respawn = {
     minTime = 900,
     maxTime = 1800

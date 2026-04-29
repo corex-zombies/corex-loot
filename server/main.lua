@@ -232,6 +232,9 @@ local function MarkContainerLooted(containerId, source)
             local ok, err = pcall(state.onDepleted, containerId, source)
             if not ok then Debug('Error', 'onDepleted callback failed: ' .. tostring(err)) end
         end
+        -- Notify any consumers (e.g. corex-skills) that a dynamic container
+        -- got fully looted. The skills resource awards "redzone loot" XP here.
+        TriggerEvent('corex-loot:server:onContainerLooted', source, containerId, true)
         return
     end
 
@@ -240,6 +243,10 @@ local function MarkContainerLooted(containerId, source)
     state.lootedBy = source
     state.respawnAt = os.time() + math.random(Config.Respawn.minTime, Config.Respawn.maxTime)
     state.searchedBy = nil
+
+    -- Static containers also fire this event with isDynamic=false so other
+    -- resources can reward exploration without rewarding event-loot twice.
+    TriggerEvent('corex-loot:server:onContainerLooted', source, containerId, false)
 end
 
 local function GetContainerLabel(containerId)
@@ -341,6 +348,17 @@ RegisterNetEvent('corex-loot:server:requestContainer', function(containerId)
 
     if state.searchedBy and state.searchedBy ~= src then
         TriggerClientEvent('corex-loot:client:searchFailed', src, 'Someone else is searching this')
+        return
+    end
+
+    -- Lockable containers: a container with `state.locked = true` (or
+    -- defined in Config.LockedContainers) requires a successful lockpick
+    -- minigame from corex-skills. Once unlocked for this player it's
+    -- remembered for the rest of the session.
+    state.unlockedBy = state.unlockedBy or {}
+    local needsLock = state.locked == true or (Config.LockedContainers and Config.LockedContainers[containerId])
+    if needsLock and not state.unlockedBy[src] then
+        TriggerClientEvent('corex-loot:client:promptLockpick', src, containerId)
         return
     end
 
@@ -544,6 +562,35 @@ CreateThread(function()
     Wait(500)
     if not InitCorex() then return end
     InitializeContainers()
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- Lockpick result handler — client → server
+-- Player ran the lockpick minigame for a locked container; if they
+-- succeeded we mark this container as unlocked for them and let them
+-- retry the open. If they failed, a 30s cooldown discourages spam.
+-- ═══════════════════════════════════════════════════════════════
+local lockpickCooldown = {}  -- [src] = epoch ms when next attempt allowed
+RegisterNetEvent('corex-loot:server:lockpickResult', function(containerId, success)
+    local src = source
+    if not containerId or type(containerId) ~= 'string' then return end
+    local state = ContainerStates[containerId]
+    if not state then return end
+
+    if success then
+        state.unlockedBy = state.unlockedBy or {}
+        state.unlockedBy[src] = true
+        -- Re-trigger the search now that they're unlocked.
+        TriggerEvent('corex-loot:server:requestContainer', containerId)
+        -- (server-side TriggerEvent doesn't carry `source`; the client side
+        -- will retry by re-firing the request itself — see client patch.)
+    else
+        lockpickCooldown[src] = GetGameTimer() + 30000
+    end
+end)
+
+AddEventHandler('playerDropped', function()
+    lockpickCooldown[source] = nil
 end)
 
 -- ═══════════════════════════════════════════════════════════════

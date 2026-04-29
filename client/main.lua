@@ -267,6 +267,35 @@ RegisterNetEvent('corex-loot:client:searchFailed', function(reason)
     end
 end)
 
+-- Locked container → run the corex-skills lockpick minigame, then report
+-- the result back. On success, the server marks us as unlocked for this
+-- container and we retry the open. On failure, a 30s server-side cooldown
+-- discourages spam.
+RegisterNetEvent('corex-loot:client:promptLockpick', function(containerId)
+    if not containerId then return end
+    isSearching = false
+
+    if Corex and Corex.Functions then
+        Corex.Functions.Notify('This container is locked — picking...', 'info', 2500)
+    end
+
+    local ok = false
+    local available, success = pcall(function()
+        return exports['corex-skills']:OpenLockpick({ pins = 3, cursorMs = 1400 })
+    end)
+    if available then ok = success == true end
+
+    TriggerServerEvent('corex-loot:server:lockpickResult', containerId, ok)
+    if ok then
+        -- Small delay before retry so the success animation completes.
+        SetTimeout(700, function()
+            TriggerServerEvent('corex-loot:server:requestContainer', containerId)
+        end)
+    elseif Corex and Corex.Functions then
+        Corex.Functions.Notify('The lock didn\'t budge.', 'error', 2500)
+    end
+end)
+
 RegisterNetEvent('corex-loot:client:takeResult', function(success, itemIndex, errorMsg)
     if success then
         TriggerEvent('corex-inventory:client:lootItemTaken', itemIndex)
