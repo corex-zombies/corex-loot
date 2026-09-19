@@ -251,13 +251,30 @@ RegisterNetEvent('corex-loot:client:searchContainer', function(entity, data)
     SearchContainer(entity, data)
 end)
 
+-- The inventory is asked to draw the container by the server, through CoreX,
+-- so nothing here names one. All that is left on this side is remembering which
+-- container is open.
 RegisterNetEvent('corex-loot:client:containerOpened', function(containerId, items, containerLabel)
     isSearching = false
     openContainerId = containerId
 
-    TriggerEvent('corex-inventory:client:openLootContainer', containerId, items, containerLabel, Config.Reveal.itemRevealDelay)
-
     Debug('Verbose', 'Container opened: ' .. containerId .. ' with ' .. #items .. ' items')
+end)
+
+-- The installed inventory could not draw a container, so its contents went
+-- somewhere the player can still reach. Which one it was is worth saying: a
+-- crate that empties onto the ground and one that empties into your pockets
+-- look identical from here otherwise.
+RegisterNetEvent('corex-loot:client:containerEmptied', function(containerId, how, count)
+    isSearching = false
+    openContainerId = nil
+
+    if not Corex or not Corex.Functions then return end
+    if how == 'spilled' then
+        Corex.Functions.Notify(('The contents spilled on the ground (%d).'):format(count or 0), 'info', 3500)
+    else
+        Corex.Functions.Notify(('You emptied it into your pockets (%d).'):format(count or 0), 'success', 3500)
+    end
 end)
 
 RegisterNetEvent('corex-loot:client:searchFailed', function(reason)
@@ -298,7 +315,7 @@ end)
 
 RegisterNetEvent('corex-loot:client:takeResult', function(success, itemIndex, errorMsg)
     if success then
-        TriggerEvent('corex-inventory:client:lootItemTaken', itemIndex)
+        TriggerEvent(CoreXInventoryEvents.ContainerItemTaken, itemIndex)
     else
         if Corex then
             Corex.Functions.Notify(errorMsg or 'Could not take item', 'error')

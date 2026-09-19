@@ -37,15 +37,24 @@ AddEventHandler('onResourceStop', function(resourceName)
     PlayerSearching = {}
 end)
 
+-- Item definitions come from whichever inventory CoreX has. There is no bundled
+-- catalog behind this any more: carrying a copy of one inventory's item file
+-- meant this resource could not start at all once that inventory was deleted
+-- from disk, and the copy went stale the moment either side changed.
+--
+-- When the installed inventory has no definition for an item, loot still names
+-- it rather than dropping it. A crate holding "bandage" with no label is worse
+-- than one holding nothing only if you never look at it.
 local function GetItemData(itemName)
-    local ok, data = pcall(function()
-        return exports['corex-inventory']:GetItemData(itemName)
-    end)
-    if ok and data then return data end
-    local lo, up = string.lower(itemName), string.upper(itemName)
-    return Items[lo] or Items[up]
-        or Weapons[lo] or Weapons[up]
-        or Ammo[lo] or Ammo[up]
+    return CoreXInventoryBridge.GetItemDefinition(itemName)
+end
+
+--- Everything the loot UI needs about an item, whether or not the inventory
+--- has ever heard of it.
+local function DescribeItem(itemName)
+    local definition = GetItemData(itemName)
+    if type(definition) == 'table' then return definition end
+    return { label = itemName, image = nil, rarity = 'common' }
 end
 
 local function GenerateContainerId(locIndex, containerIndex)
@@ -117,26 +126,24 @@ local function GenerateLoot(containerType)
         local tierItems = RollLootTable(containerType)
         if tierItems and #tierItems > 0 then
             local pick = tierItems[math.random(1, #tierItems)]
-            local data = GetItemData(pick.name)
-
-            if data then
-                local count = math.random(pick.min, pick.max)
-                loot[#loot + 1] = {
-                    name = pick.name,
-                    count = count,
-                    label = data.label or pick.name,
-                    image = data.image or 'default.png',
-                    rarity = data.rarity or 'common',
-                    taken = false
-                }
-            else
-                Debug('Warn', 'Item data not found for: ' .. pick.name)
-            end
+            -- An item the installed inventory has never heard of is still a
+            -- real item in this loot table; it goes in the crate with its own
+            -- name on it rather than silently not existing.
+            local data = DescribeItem(pick.name)
+            local count = math.random(pick.min, pick.max)
+            loot[#loot + 1] = {
+                name = pick.name,
+                count = count,
+                label = data.label or pick.name,
+                image = data.image or 'default.png',
+                rarity = data.rarity or 'common',
+                taken = false
+            }
         end
     end
 
     if #loot == 0 then
-        local fallback = GetItemData('cloth')
+        local fallback = DescribeItem('cloth')
         loot[1] = {
             name = 'cloth',
             count = 1,
@@ -296,9 +303,9 @@ local function BuildClientItems(state)
     local clientItems = {}
     for i, item in ipairs(state.items) do
         if not item.taken then
-            local data = GetItemData(item.name)
-            local w = data and data.size and data.size.w or 1
-            local h = data and data.size and data.size.h or 1
+            local data = DescribeItem(item.name)
+            local w = data.size and data.size.w or 1
+            local h = data.size and data.size.h or 1
 
             local x, y = findFreeSpot(w, h)
             if x and y then
@@ -317,6 +324,68 @@ local function BuildClientItems(state)
         end
     end
     return clientItems
+end
+
+--- Show a player what is in a container, whatever inventory they have.
+---
+--- Drawing a container is not something every inventory can do, and a loot
+--- system that only works with one of them is a loot system tied to that one.
+--- So there are three ways down, in order of how close each is to what the
+--- player expects, and the player is told which one they got:
+---
+---   1. the inventory draws the container;
+---   2. the contents spill on the ground, and they pick them up as usual;
+---   3. the contents go straight into their pockets.
+---
+--- @return boolean presented
+local function PresentContainer(src, state, containerId, clientItems, label)
+    if CoreXInventoryBridge.SupportsOperation('openContainer') then
+        local drawn = CoreXInventoryBridge.OpenContainer(src, containerId, clientItems, label, {
+            revealDelay = Config.Reveal and Config.Reveal.itemRevealDelay or nil,
+        })
+        if drawn then
+            TriggerClientEvent('corex-loot:client:containerOpened', src, containerId, clientItems, label)
+            return true
+        end
+    end
+
+    if not CoreXInventoryBridge.IsAvailable() then
+        TriggerClientEvent('corex-loot:client:searchFailed', src, 'No inventory is installed')
+        Debug('Error', 'Container refused: no inventory is available to CoreX')
+        return false
+    end
+
+    local coords = GetContainerCoords(state)
+    local spilled = CoreXInventoryBridge.SupportsOperation('createDrop') and coords ~= nil
+    local emptied = 0
+
+    for _, item in ipairs(state.items) do
+        if not item.taken then
+            local moved
+            if spilled then
+                moved = CoreXInventoryBridge.CreateDrop(item.name, item.count, coords)
+            else
+                moved = CoreXInventoryBridge.CanCarryItem(src, item.name, item.count)
+                    and CoreXInventoryBridge.AddItem(src, item.name, item.count)
+            end
+            if moved then
+                item.taken = true
+                emptied = emptied + 1
+            end
+        end
+    end
+
+    if emptied == 0 then
+        TriggerClientEvent('corex-loot:client:searchFailed', src, 'You cannot carry any of this')
+        return false
+    end
+
+    TriggerClientEvent(
+        'corex-loot:client:containerEmptied', src, containerId,
+        spilled and 'spilled' or 'taken', emptied
+    )
+    MarkContainerLooted(containerId, src)
+    return false
 end
 
 RegisterNetEvent('corex-loot:server:requestContainer', function(containerId)
@@ -368,7 +437,11 @@ RegisterNetEvent('corex-loot:server:requestContainer', function(containerId)
     local clientItems = BuildClientItems(state)
     local label = GetContainerLabel(containerId)
 
-    TriggerClientEvent('corex-loot:client:containerOpened', src, containerId, clientItems, label)
+    if not PresentContainer(src, state, containerId, clientItems, label) then
+        state.searchedBy = nil
+        PlayerSearching[src] = nil
+        return
+    end
     Debug('Verbose', 'Player ' .. src .. ' opened container ' .. containerId .. ' with ' .. #clientItems .. ' items')
 end)
 
@@ -414,20 +487,15 @@ RegisterNetEvent('corex-loot:server:takeItem', function(containerId, itemIndex)
         return
     end
 
-    local callSuccess, addSuccess, addErr = pcall(function()
-        return exports['corex-inventory']:AddItem(src, item.name, item.count)
-    end)
-
-    if not callSuccess then
-        Debug('Error', 'AddItem export failed: ' .. tostring(addErr))
-        TriggerClientEvent('corex-loot:client:takeResult', src, false, itemIndex, 'Inventory error')
+    if not CoreXInventoryBridge.IsAvailable() then
+        TriggerClientEvent('corex-loot:client:takeResult', src, false, itemIndex, 'No inventory installed')
+        Debug('Error', 'TakeItem refused: no inventory is available to CoreX')
         return
     end
 
-    if not addSuccess then
-        local reason = addErr or 'No inventory space'
-        TriggerClientEvent('corex-loot:client:takeResult', src, false, itemIndex, reason)
-        Debug('Verbose', ('TakeItem refused for %s: %s'):format(containerId, tostring(reason)))
+    if not CoreXInventoryBridge.AddItem(src, item.name, item.count) then
+        TriggerClientEvent('corex-loot:client:takeResult', src, false, itemIndex, 'No inventory space')
+        Debug('Verbose', ('TakeItem refused for %s: the inventory would not take it'):format(containerId))
         return
     end
 
@@ -625,20 +693,15 @@ exports('RegisterDynamicContainer', function(containerId, items, options)
     options = options or {}
     local normalized = {}
     for i, it in ipairs(items) do
-        local data = GetItemData(it.name)
-        if data then
-            normalized[#normalized + 1] = {
-                name   = it.name,
-                count  = it.count or 1,
-                label  = it.label  or data.label  or it.name,
-                image  = it.image  or data.image  or 'default.png',
-                rarity = it.rarity or data.rarity or 'common',
-                taken  = it.taken == true,
-            }
-        else
-            Debug('Warn', ('Dynamic container "%s": unknown item "%s" — skipped'):format(
-                containerId, tostring(it.name)))
-        end
+        local data = DescribeItem(it.name)
+        normalized[#normalized + 1] = {
+            name   = it.name,
+            count  = it.count or 1,
+            label  = it.label  or data.label  or it.name,
+            image  = it.image  or data.image  or 'default.png',
+            rarity = it.rarity or data.rarity or 'common',
+            taken  = it.taken == true,
+        }
     end
 
     ContainerStates[containerId] = {
